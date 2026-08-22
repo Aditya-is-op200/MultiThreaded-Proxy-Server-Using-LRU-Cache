@@ -103,6 +103,15 @@ int sendErrorMessage(int socket, int status_code);
  */
 int handle_request(int clientSocket, ParsedRequest *request, char *tempReq);
 
+/**
+ * @brief Establishes a TCP connection to the remote origin server on the given port.
+ * 
+ * @param host_addr Host name or IP address string of the remote server.
+ * @param port_num Port number of the remote server (default 80 for HTTP).
+ * @return Socket file descriptor on success, or -1 on error.
+ */
+int connectRemoteServer(char *host_addr, int port_num);
+
 /* ========================================================================= */
 /*                       Server State & Synchronization                      */
 /* ========================================================================= */
@@ -128,6 +137,133 @@ pthread_mutex_t lock;
 
 cache_element *head;                /* Head pointer to the LRU cache linked list */
 int cache_size;                     /* Current total memory size consumed by cache (in bytes) */
+
+/* ========================================================================= */
+/*                       Remote Request Handling                             */
+/* ========================================================================= */
+
+/**
+ * @brief Handles HTTP GET requests: connects to the remote origin server,
+ *        forwards the reconstructed request, streams the server response back
+ *        to the client socket, and caches the complete response payload.
+ *
+ * @param clientSocket Socket descriptor of the connected client.
+ * @param request Parsed request structure containing method, host, path, and headers.
+ * @param tempReq Raw client request URL string (used as cache key).
+ * @return 0 on success, or -1 on failure.
+ */
+int handle_request(int clientSocket, ParsedRequest *request, char *tempReq) {
+    char *buf = (char *)malloc(sizeof(char) * MAX_BYTES);
+    if (buf == NULL) {
+        perror("Failed to allocate memory for request buffer\n");
+        return -1;
+    }
+
+    // Reconstruct HTTP request line: "GET <path> <version>\r\n"
+    strcpy(buf, "GET ");
+    strcat(buf, request->path);
+    strcat(buf, " ");
+    strcat(buf, request->version);
+    strcat(buf, "\r\n");
+
+    size_t len = strlen(buf);
+
+    // Set "Connection: close" to ensure remote server closes connection after responding
+    if (ParsedHeader_set(request, "Connection", "close") < 0) {
+        printf("Failed to set 'Connection: close' header\n");
+    }
+
+    /*
+     * HTTP/1.1 requires a Host header on every request (allowing virtual hosting on same IP).
+     * Defensively guarantee a Host header is present by setting it from request->host if missing.
+     */
+    if (ParsedHeader_get(request, "Host") == NULL) {
+        if (ParsedHeader_set(request, "Host", request->host) < 0) {
+            printf("Failed to set 'Host' header\n");
+        }
+    }
+
+    // Unparse headers and append them to the request buffer
+    if (ParsedRequest_unparse_headers(request, buf + len, (size_t)MAX_BYTES - len) < 0) {
+        printf("Unparse headers failed\n");
+    }
+
+    // Default remote server port to 80 (standard HTTP) unless specified in request
+    int server_port = 80;
+    if (request->port != NULL) {
+        server_port = atoi(request->port);
+    }
+
+    // Establish TCP connection to origin server
+    int remoteSocketID = connectRemoteServer(request->host, server_port);
+    if (remoteSocketID < 0) {
+        free(buf);
+        return -1;
+    }
+
+    // Forward the reconstructed HTTP request to the remote origin server
+    int bytes_send = send(remoteSocketID, buf, strlen(buf), 0);
+    bzero(buf, MAX_BYTES);
+
+    // Receive origin server response and stream it to the client
+    bytes_send = recv(remoteSocketID, buf, MAX_BYTES - 1, 0);
+    char *temp_buffer = (char *)malloc(sizeof(char) * MAX_BYTES);
+    if (temp_buffer == NULL) {
+        perror("Failed to allocate memory for temp_buffer\n");
+        free(buf);
+        close(remoteSocketID);
+        return -1;
+    }
+
+    int temp_buffer_size = MAX_BYTES;
+    int temp_buffer_index = 0;
+
+    while (bytes_send > 0) {
+        // Relay received chunk to client socket
+        bytes_send = send(clientSocket, buf, bytes_send, 0);
+        if (bytes_send < 0) {
+            perror("Error in sending data to client socket.\n");
+            break;
+        }
+
+        // Accumulate received chunk into temp_buffer for LRU caching
+        for (int i = 0; i < bytes_send / (int)sizeof(char); i++) {
+            temp_buffer[temp_buffer_index] = buf[i];
+            temp_buffer_index++;
+        }
+
+        // Dynamically expand buffer capacity for subsequent response chunks
+        temp_buffer_size += MAX_BYTES;
+        char *realloc_ptr = (char *)realloc(temp_buffer, temp_buffer_size);
+        if (realloc_ptr == NULL) {
+            perror("Failed to reallocate memory for temp_buffer\n");
+            break;
+        }
+        temp_buffer = realloc_ptr;
+
+        bzero(buf, MAX_BYTES);
+        bytes_send = recv(remoteSocketID, buf, MAX_BYTES - 1, 0);
+    }
+
+    temp_buffer[temp_buffer_index] = '\0';
+    free(buf);
+
+    // Cache the complete response payload for future requests
+    add_cache_element(temp_buffer, strlen(temp_buffer), tempReq);
+    printf("Done\n");
+    free(temp_buffer);
+
+    close(remoteSocketID);
+    return 0;
+}
+
+
+
+
+
+
+
+
 
 /* ========================================================================= */
 /*                       Client Request Worker Thread                        */
